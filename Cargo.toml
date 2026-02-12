@@ -1,0 +1,18 @@
+[package]
+name = "fluss-datafusion"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fluss = { package = "fluss-rs", git = "https://github.com/apache/fluss-rust.git" }
+datafusion = "52.1.0"
+arrow = { version = "57", features = ["prettyprint"] }
+arrow-schema = "57"
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+rustyline = "15"
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1"
