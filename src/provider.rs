@@ -1,3 +1,7 @@
+mod insert_exec;
+mod lookup_exec;
+mod scan_exec;
+
 use std::any::Any;
 use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
@@ -5,41 +9,35 @@ use std::time::Duration;
 
 use arrow::array::{
     ArrayRef, BooleanBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder,
-    Int64Builder, Int8Builder, RecordBatch, StringBuilder, UInt64Array,
+    Int64Builder, Int8Builder, RecordBatch, StringBuilder,
 };
-use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef};
+use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
+use datafusion::common::ScalarValue;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result;
 use datafusion::execution::context::TaskContext;
 use datafusion::logical_expr::dml::InsertOp;
-use datafusion::logical_expr::Expr;
-use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::memory::MemoryStream;
-use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
-};
-use futures::StreamExt;
-
+use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
+use datafusion::physical_plan::ExecutionPlan;
 use fluss::client::FlussConnection;
 use fluss::metadata::{DataType as FlussDataType, TableInfo};
 use fluss::record::to_arrow_schema;
 use fluss::row::{GenericRow, InternalRow};
+use futures::StreamExt;
 
 use crate::error::fluss_err;
+pub use insert_exec::FlussInsertExec;
+pub use lookup_exec::FlussLookupExec;
+pub use scan_exec::FlussScanExec;
 
-fn to_fluss_err(msg: String) -> fluss::error::Error {
+pub(crate) fn to_fluss_err(msg: String) -> fluss::error::Error {
     fluss::error::Error::UnexpectedError {
         message: msg,
         source: None,
     }
 }
-
-// ---------------------------------------------------------------------------
-// FlussTableProvider
-// ---------------------------------------------------------------------------
 
 pub struct FlussTableProvider {
     conn: Arc<FlussConnection>,
@@ -82,9 +80,22 @@ impl TableProvider for FlussTableProvider {
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        if self.table_info.has_primary_key() {
+            if let Some((pk_index, pk_literal)) = extract_pk_eq_literal(filters, &self.table_info) {
+                return Ok(Arc::new(FlussLookupExec::new(
+                    self.conn.clone(),
+                    self.table_info.clone(),
+                    self.arrow_schema.clone(),
+                    projection.cloned(),
+                    pk_index,
+                    pk_literal,
+                )));
+            }
+        }
+
         Ok(Arc::new(FlussScanExec::new(
             self.conn.clone(),
             self.table_info.clone(),
@@ -106,125 +117,108 @@ impl TableProvider for FlussTableProvider {
             input,
         )))
     }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>> {
+        if !self.table_info.has_primary_key() {
+            return Ok(filters
+                .iter()
+                .map(|_| TableProviderFilterPushDown::Unsupported)
+                .collect());
+        }
+
+        Ok(filters
+            .iter()
+            .map(|f| {
+                if is_pk_eq_literal_filter(f, &self.table_info) {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
+    }
 }
 
-// ---------------------------------------------------------------------------
-// FlussScanExec – scan changelog from earliest→latest, with optional limit.
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-pub struct FlussScanExec {
-    conn: Arc<FlussConnection>,
-    table_info: TableInfo,
-    projection: Option<Vec<usize>>,
-    limit: Option<usize>,
-    props: PlanProperties,
+fn primary_key_info(table_info: &TableInfo) -> Option<(usize, &str)> {
+    let pk = table_info.schema.primary_key()?;
+    if pk.column_names().len() != 1 {
+        return None;
+    }
+    let name = pk.column_names()[0].as_str();
+    let idx = table_info
+        .schema
+        .columns()
+        .iter()
+        .position(|c| c.name() == name)?;
+    Some((idx, name))
 }
 
-impl FlussScanExec {
-    pub fn new(
-        conn: Arc<FlussConnection>,
-        table_info: TableInfo,
-        arrow_schema: SchemaRef,
-        projection: Option<Vec<usize>>,
-        limit: Option<usize>,
-    ) -> Self {
-        let projected_schema = match &projection {
-            Some(indices) => Arc::new(arrow_schema.project(indices).unwrap()),
-            None => arrow_schema,
+fn parse_eq_col_literal(expr: &Expr) -> Option<(String, ScalarValue)> {
+    let Expr::BinaryExpr(be) = expr else {
+        return None;
+    };
+    if be.op != Operator::Eq {
+        return None;
+    }
+
+    match (unwrap_col_expr(&be.left), unwrap_lit_expr(&be.right)) {
+        (Some(c), Some(v)) => Some((c, v)),
+        _ => match (unwrap_lit_expr(&be.left), unwrap_col_expr(&be.right)) {
+            (Some(v), Some(c)) => Some((c, v)),
+            _ => None,
+        },
+    }
+}
+
+fn unwrap_col_expr(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Column(c) => Some(c.name.clone()),
+        Expr::Cast(cast) => unwrap_col_expr(&cast.expr),
+        Expr::TryCast(cast) => unwrap_col_expr(&cast.expr),
+        _ => None,
+    }
+}
+
+fn unwrap_lit_expr(expr: &Expr) -> Option<ScalarValue> {
+    match expr {
+        Expr::Literal(v, _) => Some(v.clone()),
+        Expr::Cast(cast) => unwrap_lit_expr(&cast.expr),
+        Expr::TryCast(cast) => unwrap_lit_expr(&cast.expr),
+        _ => None,
+    }
+}
+
+fn col_eq(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+fn is_pk_eq_literal_filter(expr: &Expr, table_info: &TableInfo) -> bool {
+    let Some((_, pk_name)) = primary_key_info(table_info) else {
+        return false;
+    };
+    let Some((col, _)) = parse_eq_col_literal(expr) else {
+        return false;
+    };
+    col_eq(&col, pk_name)
+}
+
+fn extract_pk_eq_literal(filters: &[Expr], table_info: &TableInfo) -> Option<(usize, ScalarValue)> {
+    let (pk_index, pk_name) = primary_key_info(table_info)?;
+    for f in filters {
+        let Some((col, lit)) = parse_eq_col_literal(f) else {
+            continue;
         };
-        let props = PlanProperties::new(
-            EquivalenceProperties::new(projected_schema),
-            datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        );
-        Self {
-            conn,
-            table_info,
-            projection,
-            limit,
-            props,
+        if col_eq(&col, pk_name) {
+            return Some((pk_index, lit));
         }
     }
-
-    fn projected_schema(&self) -> SchemaRef {
-        self.props.equivalence_properties().schema().clone()
-    }
+    None
 }
 
-impl Debug for FlussScanExec {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FlussScanExec")
-            .field("table", &self.table_info.table_path.to_string())
-            .field("projection", &self.projection)
-            .field("limit", &self.limit)
-            .finish()
-    }
-}
-
-impl DisplayAs for FlussScanExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
-        write!(
-            f,
-            "FlussScanExec: table={}, limit={:?}",
-            self.table_info.table_path, self.limit
-        )
-    }
-}
-
-impl ExecutionPlan for FlussScanExec {
-    fn name(&self) -> &'static str {
-        "FlussScanExec"
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn properties(&self) -> &PlanProperties {
-        &self.props
-    }
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![]
-    }
-    fn with_new_children(
-        self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(self)
-    }
-
-    fn execute(
-        &self,
-        _partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
-        let conn = self.conn.clone();
-        let table_info = self.table_info.clone();
-        let projection = self.projection.clone();
-        let limit = self.limit;
-        let projected_schema = self.projected_schema();
-
-        let batches: Vec<RecordBatch> = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                scan_table(&conn, &table_info, projection.as_deref(), limit)
-                    .await
-                    .unwrap_or_default()
-            })
-        });
-
-        Ok(Box::pin(MemoryStream::try_new(
-            batches,
-            projected_schema,
-            None,
-        )?))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Scan implementation: read changelog from earliest to latest offset.
-// ---------------------------------------------------------------------------
-
-async fn scan_table(
+pub(crate) async fn scan_table(
     conn: &FlussConnection,
     table_info: &TableInfo,
     projection: Option<&[usize]>,
@@ -235,13 +229,7 @@ async fn scan_table(
             message: "must be with LIMIT".to_string(),
         });
     }
-    match scan_table_with_log_scanner_limit(conn, table_info, projection, limit).await {
-        Ok(batches) => Ok(batches),
-        Err(e) => {
-            println!("scan error: {:?}", e);
-            Err(e)
-        }
-    }
+    scan_table_with_log_scanner_limit(conn, table_info, projection, limit).await
 }
 
 enum ColBuilder {
@@ -336,6 +324,126 @@ fn make_builders(
     Ok(out)
 }
 
+fn append_row_to_builders(
+    builders: &mut [ColBuilder],
+    row: &dyn InternalRow,
+    row_indices: &[usize],
+) {
+    for (b, idx) in builders.iter_mut().zip(row_indices.iter().copied()) {
+        b.append_from_row(row, idx);
+    }
+}
+
+fn projected_indices(table_info: &TableInfo, projection: Option<&[usize]>) -> Vec<usize> {
+    match projection {
+        Some(v) => v.to_vec(),
+        None => (0..table_info.row_type.fields().len()).collect(),
+    }
+}
+
+fn set_pk_key_from_scalar(
+    key: &mut GenericRow<'_>,
+    data_type: &FlussDataType,
+    literal: &ScalarValue,
+) -> std::result::Result<(), fluss::error::Error> {
+    match (data_type, literal) {
+        (FlussDataType::TinyInt(_), ScalarValue::Int8(Some(v))) => key.set_field(0, *v),
+        (FlussDataType::SmallInt(_), ScalarValue::Int16(Some(v))) => key.set_field(0, *v),
+        (FlussDataType::Int(_), ScalarValue::Int32(Some(v))) => key.set_field(0, *v),
+        (FlussDataType::BigInt(_), ScalarValue::Int64(Some(v))) => key.set_field(0, *v),
+        (FlussDataType::Char(_), ScalarValue::Utf8(Some(v)))
+        | (FlussDataType::String(_), ScalarValue::Utf8(Some(v))) => key.set_field(0, v.clone()),
+        (FlussDataType::Char(_), ScalarValue::LargeUtf8(Some(v)))
+        | (FlussDataType::String(_), ScalarValue::LargeUtf8(Some(v))) => {
+            key.set_field(0, v.clone())
+        }
+        _ => {
+            return Err(to_fluss_err(format!(
+                "PK literal type mismatch, pk_type={data_type:?}, literal={literal:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn lookup_pk_row(
+    conn: &FlussConnection,
+    table_info: &TableInfo,
+    projection: Option<&[usize]>,
+    pk_index: usize,
+    pk_literal: &ScalarValue,
+) -> std::result::Result<Vec<RecordBatch>, fluss::error::Error> {
+    let metadata = conn.get_metadata();
+    let mut lookup_table_info = table_info.clone();
+    lookup_table_info.properties.remove("table.datalake.format");
+    let table = fluss::client::FlussTable::new(conn, metadata, lookup_table_info.clone());
+    let table_lookup = table.new_lookup().map_err(|e| {
+        to_fluss_err(format!(
+            "lookup step failed: table.new_lookup() on {}: {e:?}",
+            table_info.table_path
+        ))
+    })?;
+    let mut lookuper = table_lookup.create_lookuper().map_err(|e| {
+        to_fluss_err(format!(
+            "lookup step failed: create_lookuper() on {}: {e:?}",
+            table_info.table_path
+        ))
+    })?;
+
+    let pk_data_type = table_info.schema.columns()[pk_index].data_type().clone();
+    let mut key = GenericRow::new(1);
+    set_pk_key_from_scalar(&mut key, &pk_data_type, pk_literal).map_err(|e| {
+        to_fluss_err(format!(
+            "lookup step failed: set_pk_key_from_scalar() pk_type={pk_data_type:?}, literal={pk_literal:?}: {e:?}"
+        ))
+    })?;
+
+    let result = lookuper.lookup(&key).await.map_err(|e| {
+        to_fluss_err(format!(
+            "lookup step failed: lookuper.lookup() on {}: {e:?}",
+            table_info.table_path
+        ))
+    })?;
+    let Some(row) = result.get_single_row().map_err(|e| {
+        to_fluss_err(format!(
+            "lookup step failed: get_single_row() on {}: {e:?}",
+            table_info.table_path
+        ))
+    })?
+    else {
+        return Ok(vec![]);
+    };
+
+    let indices = projected_indices(table_info, projection);
+    let projected_fields: Vec<&fluss::metadata::DataField> = indices
+        .iter()
+        .map(|&i| &table_info.row_type.fields()[i])
+        .collect();
+    let mut builders = make_builders(&projected_fields, 1).map_err(|e| {
+        to_fluss_err(format!(
+            "lookup step failed: make_builders() projected_fields={:?}: {e:?}",
+            projected_fields
+                .iter()
+                .map(|f| format!("{}:{:?}", f.name(), f.data_type()))
+                .collect::<Vec<_>>()
+        ))
+    })?;
+    append_row_to_builders(&mut builders, &row, &indices);
+
+    let arrays: Vec<ArrayRef> = builders.into_iter().map(ColBuilder::finish).collect();
+    let schema = match projection {
+        Some(idxs) => Arc::new(
+            to_arrow_schema(&table_info.row_type)?
+                .project(idxs)
+                .map_err(|e| to_fluss_err(format!("project schema failed: {e}")))?,
+        ),
+        None => to_arrow_schema(&table_info.row_type)?,
+    };
+    let batch = RecordBatch::try_new(schema, arrays)
+        .map_err(|e| to_fluss_err(format!("build record batch failed: {e}")))?;
+    Ok(vec![batch])
+}
+
 async fn scan_table_with_log_scanner_limit(
     conn: &FlussConnection,
     table_info: &TableInfo,
@@ -373,7 +481,6 @@ async fn scan_table_with_log_scanner_limit(
     let mut collected = 0usize;
     let mut empty_polls = 0usize;
 
-    // Simple strategy: poll until enough rows or several empty polls.
     while collected < lim && empty_polls < 3 {
         let records = scanner.poll(Duration::from_secs(2)).await?;
         if records.is_empty() {
@@ -412,111 +519,7 @@ async fn scan_table_with_log_scanner_limit(
     Ok(vec![batch])
 }
 
-// ---------------------------------------------------------------------------
-// FlussInsertExec – upsert into Fluss PK table.
-// ---------------------------------------------------------------------------
-
-pub struct FlussInsertExec {
-    conn: Arc<FlussConnection>,
-    table_info: TableInfo,
-    input: Arc<dyn ExecutionPlan>,
-    props: PlanProperties,
-}
-
-impl FlussInsertExec {
-    pub fn new(
-        conn: Arc<FlussConnection>,
-        table_info: TableInfo,
-        input: Arc<dyn ExecutionPlan>,
-    ) -> Self {
-        let count_schema = Arc::new(Schema::new(vec![Field::new(
-            "count",
-            ArrowDataType::UInt64,
-            false,
-        )]));
-        let props = PlanProperties::new(
-            EquivalenceProperties::new(count_schema),
-            datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
-            EmissionType::Final,
-            Boundedness::Bounded,
-        );
-        Self {
-            conn,
-            table_info,
-            input,
-            props,
-        }
-    }
-}
-
-impl Debug for FlussInsertExec {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "FlussInsertExec: table={}", self.table_info.table_path)
-    }
-}
-
-impl DisplayAs for FlussInsertExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
-        write!(f, "FlussInsertExec: table={}", self.table_info.table_path)
-    }
-}
-
-impl ExecutionPlan for FlussInsertExec {
-    fn name(&self) -> &'static str {
-        "FlussInsertExec"
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn properties(&self) -> &PlanProperties {
-        &self.props
-    }
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input]
-    }
-    fn with_new_children(
-        self: Arc<Self>,
-        mut children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(FlussInsertExec::new(
-            self.conn.clone(),
-            self.table_info.clone(),
-            children.remove(0),
-        )))
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        context: Arc<TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
-        let conn = self.conn.clone();
-        let table_info = self.table_info.clone();
-        let input = self.input.clone();
-        let count_schema = self.props.equivalence_properties().schema().clone();
-
-        let total_rows: u64 = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                upsert_batches(&conn, &table_info, input, partition, context)
-                    .await
-                    .unwrap_or(0)
-            })
-        });
-
-        let count_batch = RecordBatch::try_new(
-            count_schema.clone(),
-            vec![Arc::new(UInt64Array::from(vec![total_rows]))],
-        )?;
-        Ok(Box::pin(MemoryStream::try_new(
-            vec![count_batch],
-            count_schema,
-            None,
-        )?))
-    }
-}
-
-/// Upsert all batches from the input plan into the Fluss table.
-async fn upsert_batches(
+pub(crate) async fn upsert_batches(
     conn: &FlussConnection,
     table_info: &TableInfo,
     input: Arc<dyn ExecutionPlan>,
@@ -548,7 +551,6 @@ async fn upsert_batches(
     Ok(total)
 }
 
-/// Extract a value from a RecordBatch column and set it on a GenericRow.
 fn set_generic_row_from_batch(
     row: &mut GenericRow<'_>,
     col_idx: usize,

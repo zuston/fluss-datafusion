@@ -109,7 +109,7 @@ impl SchemaProvider for FlussSchema {
         if !exists {
             return Ok(None);
         }
-        let table_info = admin.get_table(&path).await.map_err(fluss_err)?;
+        let table_info = admin.get_table_info(&path).await.map_err(fluss_err)?;
         Ok(Some(Arc::new(FlussTableProvider::new(
             self.conn.clone(),
             table_info,

@@ -3,11 +3,11 @@ mod cli;
 mod error;
 mod provider;
 
-use clap::Parser;
-use std::sync::Arc;
-
 use crate::catalog::FlussCatalog;
 use crate::cli::FlussCliSession;
+use clap::Parser;
+use nu_ansi_term::Color;
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -26,19 +26,30 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let banner = r#"
+
+        ███████╗██╗     ██╗   ██╗███████╗███████╗
+        ██╔════╝██║     ██║   ██║██╔════╝██╔════╝
+        █████╗  ██║     ██║   ██║███████╗███████╗
+        ██╔══╝  ██║     ██║   ██║╚════██║╚════██║
+        ██║     ███████╗╚██████╔╝███████║███████║
+        ╚═╝     ╚══════╝ ╚═════╝ ╚══════╝╚══════╝
+"#;
+    println!("{}", Color::Cyan.paint(banner));
+
     let args = Args::parse();
 
     println!("Fluss SQL CLI (powered by Apache DataFusion)");
     println!("Connecting to {}...", args.bootstrap_server);
 
     let config = fluss::config::Config {
-        bootstrap_server: args.bootstrap_server.to_owned(),
-        request_max_size: 10 * 1024 * 1024,
+        bootstrap_servers: args.bootstrap_server.to_owned(),
+        writer_request_max_size: 10 * 1024 * 1024,
         writer_acks: "all".to_owned(),
         writer_retries: 0,
         writer_batch_size: 2 * 1024 * 1024,
         scanner_remote_log_prefetch_num: 4,
-        scanner_remote_log_download_threads: 3,
+        remote_file_download_thread_num: 3,
     };
 
     let conn = fluss::client::FlussConnection::new(config).await?;

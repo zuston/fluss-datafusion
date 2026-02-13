@@ -1599,6 +1599,7 @@ dependencies = [
  "fluss-rs",
  "futures",
  "log",
+ "nu-ansi-term",
  "rustyline",
  "tokio",
 ]
@@ -1606,7 +1607,7 @@ dependencies = [
 [[package]]
 name = "fluss-rs"
 version = "0.1.0"
-source = "git+https://github.com/apache/fluss-rust.git#a447db9f7f59f76808a313214bb67647858992b5"
+source = "git+https://github.com/zuston/fluss-rust.git?branch=test_all_1#a996091ce104c118df2c684a9f0422d7f853c086"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -2455,6 +2456,15 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+]
+
+[[package]]
+name = "nu-ansi-term"
+version = "0.50.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
