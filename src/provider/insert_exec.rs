@@ -98,9 +98,18 @@ impl ExecutionPlan for FlussInsertExec {
 
         let total_rows: u64 = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
-                upsert_batches(&conn, &table_info, input, partition, context)
-                    .await
-                    .unwrap_or(0)
+                match upsert_batches(&conn, &table_info, input, partition, context).await {
+                    Ok(total) => total,
+                    Err(e) => {
+                        log::error!(
+                            "FlussInsertExec failed: table={}, partition={}, error={:?}",
+                            table_info.table_path,
+                            partition,
+                            e
+                        );
+                        0
+                    }
+                }
             })
         });
 

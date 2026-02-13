@@ -109,6 +109,9 @@ impl ExecutionPlan for FlussLookupExec {
         let projection = self.projection.clone();
         let pk_index = self.pk_index;
         let pk_literal = self.pk_literal.clone();
+        let pk_literal_for_log = pk_literal.clone();
+        let projection_for_log = projection.clone();
+        let table_path_for_log = table_info.table_path.to_string();
         let projected_schema = self.projected_schema();
 
         let batches_res: std::result::Result<Vec<RecordBatch>, fluss::error::Error> =
@@ -124,7 +127,20 @@ impl ExecutionPlan for FlussLookupExec {
                     .await
                 })
             });
-        let batches = batches_res.map_err(fluss_err)?;
+        let batches = match batches_res {
+            Ok(batches) => batches,
+            Err(e) => {
+                log::error!(
+                    "FlussLookupExec failed: table={}, pk_index={}, pk_literal={:?}, projection={:?}, error={:?}",
+                    table_path_for_log,
+                    pk_index,
+                    pk_literal_for_log,
+                    projection_for_log,
+                    e
+                );
+                return Err(fluss_err(e));
+            }
+        };
 
         Ok(Box::pin(MemoryStream::try_new(
             batches,

@@ -111,9 +111,18 @@ impl ExecutionPlan for FlussScanExec {
 
         let batches: Vec<RecordBatch> = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
-                scan_table(&conn, &table_info, projection.as_deref(), limit)
-                    .await
-                    .unwrap_or_default()
+                match scan_table(&conn, &table_info, projection.as_deref(), limit).await {
+                    Ok(batches) => batches,
+                    Err(e) => {
+                        log::error!(
+                            "FlussScanExec failed: table={}, limit={:?}, error={:?}",
+                            table_info.table_path,
+                            limit,
+                            e
+                        );
+                        Vec::new()
+                    }
+                }
             })
         });
 

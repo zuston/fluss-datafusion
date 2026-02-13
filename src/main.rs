@@ -26,6 +26,8 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    logforth::stderr().apply();
+
     let banner = r#"
 
         ███████╗██╗     ██╗   ██╗███████╗███████╗
