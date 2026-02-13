@@ -10,6 +10,7 @@ A lightweight Fluss SQL CLI built on Apache DataFusion.
 - [x] `SHOW TABLES`
 - [x] `SHOW CREATE TABLE <table>`
 - [ ] `SELECT ... FROM ... LIMIT 10` for kv/log table
+- [ ] add support of timestamp data type
 
 ## Example
 
@@ -17,10 +18,10 @@ A lightweight Fluss SQL CLI built on Apache DataFusion.
 CREATE TABLE user (
   id BIGINT NOT NULL,
   name STRING,
-  created_at TIMESTAMP,
   PRIMARY KEY (id)
 );
-INSERT INTO user (id, name, created_at) VALUES (1, 'alice', TIMESTAMP '2026-02-13 10:00:00');
+INSERT INTO user (id, name) VALUES (1, 'alice');
+SELECT * FROM user WHERE id = 1;
 SHOW TABLES;
 SHOW CREATE TABLE user;
 ```
