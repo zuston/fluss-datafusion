@@ -9,12 +9,11 @@ use rustyline::DefaultEditor;
 /// Interactive SQL session backed by DataFusion + Fluss.
 pub struct FlussCliSession {
     ctx: SessionContext,
-    conn: Arc<FlussConnection>,
 }
 
 impl FlussCliSession {
-    pub fn new(ctx: SessionContext, conn: Arc<FlussConnection>) -> Self {
-        Self { ctx, conn }
+    pub fn new(ctx: SessionContext, _conn: Arc<FlussConnection>) -> Self {
+        Self { ctx }
     }
 
     pub async fn run(&mut self) {
@@ -45,7 +44,7 @@ impl FlussCliSession {
                             continue;
                         }
                         if trimmed.starts_with("\\dt") {
-                            self.show_tables().await;
+                            self.execute_sql("SHOW TABLES;").await;
                             continue;
                         }
                         if trimmed.is_empty() {
@@ -77,7 +76,10 @@ impl FlussCliSession {
     }
 
     async fn execute_sql(&self, sql: &str) {
-        match self.ctx.sql(sql).await {
+        let rewritten = rewrite_show_tables_sql(sql, self.current_database());
+        let sql_to_run = rewritten.as_deref().unwrap_or(sql);
+
+        match self.ctx.sql(sql_to_run).await {
             Ok(df) => match df.collect().await {
                 Ok(batches) => {
                     if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
@@ -95,38 +97,14 @@ impl FlussCliSession {
         }
     }
 
-    async fn show_tables(&self) {
-        let admin = match self.conn.get_admin().await {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("Failed to get admin: {e}");
-                return;
-            }
-        };
-
-        // Determine current database from DataFusion config.
-        let db = self
-            .ctx
+    fn current_database(&self) -> String {
+        self.ctx
             .state()
             .config()
             .options()
             .catalog
             .default_schema
-            .clone();
-
-        match admin.list_tables(&db).await {
-            Ok(tables) => {
-                if tables.is_empty() {
-                    println!("No tables in database '{db}'.");
-                } else {
-                    println!("Tables in '{db}':");
-                    for t in &tables {
-                        println!("  {t}");
-                    }
-                }
-            }
-            Err(e) => eprintln!("Error listing tables: {e}"),
-        }
+            .clone()
     }
 }
 
@@ -140,4 +118,46 @@ Commands:
   \? / help         Show this help
 "#
     );
+}
+
+fn parse_show_tables(sql: &str) -> Option<Option<String>> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let original_tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    let tokens: Vec<String> = original_tokens
+        .iter()
+        .map(|t| t.to_ascii_lowercase())
+        .collect();
+
+    if tokens.len() == 2 && tokens[0] == "show" && tokens[1] == "tables" {
+        return Some(None);
+    }
+
+    if tokens.len() == 4
+        && tokens[0] == "show"
+        && tokens[1] == "tables"
+        && (tokens[2] == "from" || tokens[2] == "in")
+    {
+        return Some(Some(original_tokens[3].to_string()));
+    }
+
+    None
+}
+
+fn rewrite_show_tables_sql(sql: &str, current_db: String) -> Option<String> {
+    let database = parse_show_tables(sql)?
+        .map(|db| trim_identifier_quotes(&db).to_string())
+        .unwrap_or(current_db);
+    let escaped_db = database.replace('\'', "''");
+
+    Some(format!(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = '{escaped_db}' ORDER BY table_name"
+    ))
+}
+
+fn trim_identifier_quotes(input: &str) -> &str {
+    input
+        .strip_prefix('`')
+        .and_then(|s| s.strip_suffix('`'))
+        .or_else(|| input.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+        .unwrap_or(input)
 }
