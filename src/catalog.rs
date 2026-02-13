@@ -3,15 +3,19 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::StringArray;
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
+use datafusion::common::Constraint;
 use datafusion::datasource::MemTable;
 use datafusion::error::DataFusionError;
 use datafusion::error::Result;
 use fluss::client::FlussConnection;
-use fluss::metadata::{TableInfo, TablePath};
+use fluss::metadata::{
+    DataType as FlussDataType, DataTypes, Schema as FlussTableSchema, TableDescriptor, TableInfo,
+    TablePath,
+};
 
 use crate::error::fluss_err;
 use crate::provider::FlussTableProvider;
@@ -134,9 +138,9 @@ impl SchemaProvider for FlussInformationSchema {
             }
 
             let schema = Arc::new(Schema::new(vec![
-                Field::new("table_schema", DataType::Utf8, false),
-                Field::new("table_name", DataType::Utf8, false),
-                Field::new("table_type", DataType::Utf8, false),
+                Field::new("table_schema", ArrowDataType::Utf8, false),
+                Field::new("table_name", ArrowDataType::Utf8, false),
+                Field::new("table_type", ArrowDataType::Utf8, false),
             ]));
             let batch = RecordBatch::try_new(
                 schema.clone(),
@@ -173,9 +177,9 @@ impl SchemaProvider for FlussInformationSchema {
             }
 
             let schema = Arc::new(Schema::new(vec![
-                Field::new("table_schema", DataType::Utf8, false),
-                Field::new("table_name", DataType::Utf8, false),
-                Field::new("create_table", DataType::Utf8, false),
+                Field::new("table_schema", ArrowDataType::Utf8, false),
+                Field::new("table_name", ArrowDataType::Utf8, false),
+                Field::new("create_table", ArrowDataType::Utf8, false),
             ]));
             let batch = RecordBatch::try_new(
                 schema.clone(),
@@ -292,6 +296,81 @@ impl FlussSchema {
     }
 }
 
+fn datafusion_table_to_fluss_descriptor(table: &Arc<dyn TableProvider>) -> Result<TableDescriptor> {
+    let schema = table.schema();
+    let mut schema_builder = FlussTableSchema::builder();
+    for field in schema.fields() {
+        let mut data_type = arrow_to_fluss_type(field.data_type())?;
+        if !field.is_nullable() {
+            data_type = data_type.as_non_nullable();
+        }
+        schema_builder = schema_builder.column(field.name().to_string(), data_type);
+    }
+
+    if let Some(constraints) = table.constraints() {
+        for constraint in constraints.iter() {
+            if let Constraint::PrimaryKey(indices) = constraint {
+                let mut pk_columns = Vec::with_capacity(indices.len());
+                for idx in indices {
+                    let field = schema.field(*idx);
+                    pk_columns.push(field.name().to_string());
+                }
+                schema_builder = schema_builder.primary_key(pk_columns);
+                break;
+            }
+        }
+    }
+
+    let schema = match schema_builder.build() {
+        Ok(schema) => schema,
+        Err(e) => return Err(DataFusionError::Execution(e.to_string())),
+    };
+    match TableDescriptor::builder().schema(schema).build() {
+        Ok(descriptor) => Ok(descriptor),
+        Err(e) => Err(DataFusionError::Execution(e.to_string())),
+    }
+}
+
+fn arrow_to_fluss_type(data_type: &ArrowDataType) -> Result<FlussDataType> {
+    match data_type {
+        ArrowDataType::Boolean => Ok(DataTypes::boolean()),
+        ArrowDataType::Int8 | ArrowDataType::UInt8 => Ok(DataTypes::tinyint()),
+        ArrowDataType::Int16 | ArrowDataType::UInt16 => Ok(DataTypes::smallint()),
+        ArrowDataType::Int32 | ArrowDataType::UInt32 => Ok(DataTypes::int()),
+        ArrowDataType::Int64 | ArrowDataType::UInt64 => Ok(DataTypes::bigint()),
+        ArrowDataType::Float32 => Ok(DataTypes::float()),
+        ArrowDataType::Float64 => Ok(DataTypes::double()),
+        ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 | ArrowDataType::Utf8View => {
+            Ok(DataTypes::string())
+        }
+        ArrowDataType::Binary | ArrowDataType::LargeBinary | ArrowDataType::FixedSizeBinary(_) => {
+            Ok(DataTypes::bytes())
+        }
+        ArrowDataType::Date32 | ArrowDataType::Date64 => Ok(DataTypes::date()),
+        ArrowDataType::Time32(_) | ArrowDataType::Time64(_) => Ok(DataTypes::time()),
+        ArrowDataType::Timestamp(_, _) => Ok(DataTypes::timestamp()),
+        ArrowDataType::Decimal128(precision, scale) => {
+            let scale = u32::try_from(*scale).map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "negative decimal scale is unsupported: {scale}"
+                ))
+            })?;
+            Ok(DataTypes::decimal(u32::from(*precision), scale))
+        }
+        ArrowDataType::Decimal256(precision, scale) => {
+            let scale = u32::try_from(*scale).map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "negative decimal scale is unsupported: {scale}"
+                ))
+            })?;
+            Ok(DataTypes::decimal(u32::from(*precision), scale))
+        }
+        other => Err(DataFusionError::Execution(format!(
+            "unsupported CREATE TABLE type in Fluss schema: {other}"
+        ))),
+    }
+}
+
 #[async_trait]
 impl SchemaProvider for FlussSchema {
     fn as_any(&self) -> &dyn Any {
@@ -324,6 +403,28 @@ impl SchemaProvider for FlussSchema {
             self.conn.clone(),
             table_info,
         )?)))
+    }
+
+    fn register_table(
+        &self,
+        name: String,
+        table: Arc<dyn TableProvider>,
+    ) -> Result<Option<Arc<dyn TableProvider>>> {
+        let descriptor = datafusion_table_to_fluss_descriptor(&table)?;
+        let conn = self.conn.clone();
+        let database = self.database.clone();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let admin = conn.get_admin().await.map_err(fluss_err)?;
+                let table_path = TablePath::new(database, name);
+                admin
+                    .create_table(&table_path, &descriptor, false)
+                    .await
+                    .map_err(fluss_err)?;
+                Ok::<(), DataFusionError>(())
+            })
+        })?;
+        Ok(None)
     }
 
     fn table_exist(&self, name: &str) -> bool {
