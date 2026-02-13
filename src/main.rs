@@ -42,15 +42,8 @@ async fn main() -> anyhow::Result<()> {
     println!("Fluss SQL CLI (powered by Apache DataFusion)");
     println!("Connecting to {}...", args.bootstrap_server);
 
-    let config = fluss::config::Config {
-        bootstrap_servers: args.bootstrap_server.to_owned(),
-        writer_request_max_size: 10 * 1024 * 1024,
-        writer_acks: "all".to_owned(),
-        writer_retries: 0,
-        writer_batch_size: 2 * 1024 * 1024,
-        scanner_remote_log_prefetch_num: 4,
-        remote_file_download_thread_num: 3,
-    };
+    let mut config = fluss::config::Config::default();
+    config.bootstrap_servers = args.bootstrap_server.to_owned();
 
     let conn = fluss::client::FlussConnection::new(config).await?;
     let conn = Arc::new(conn);
