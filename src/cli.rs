@@ -76,7 +76,7 @@ impl FlussCliSession {
     }
 
     async fn execute_sql(&self, sql: &str) {
-        let rewritten = rewrite_show_tables_sql(sql, self.current_database());
+        let rewritten = rewrite_sql(sql, self.current_database());
         let sql_to_run = rewritten.as_deref().unwrap_or(sql);
 
         match self.ctx.sql(sql_to_run).await {
@@ -143,7 +143,15 @@ fn parse_show_tables(sql: &str) -> Option<Option<String>> {
     None
 }
 
-fn rewrite_show_tables_sql(sql: &str, current_db: String) -> Option<String> {
+fn rewrite_sql(sql: &str, current_db: String) -> Option<String> {
+    if let Some((database, table_name)) = parse_show_create_table(sql, &current_db) {
+        let escaped_db = database.replace('\'', "''");
+        let escaped_table = table_name.replace('\'', "''");
+        return Some(format!(
+            "SELECT create_table FROM information_schema.table_ddl WHERE table_schema = '{escaped_db}' AND table_name = '{escaped_table}'"
+        ));
+    }
+
     let database = parse_show_tables(sql)?
         .map(|db| trim_identifier_quotes(&db).to_string())
         .unwrap_or(current_db);
@@ -152,6 +160,29 @@ fn rewrite_show_tables_sql(sql: &str, current_db: String) -> Option<String> {
     Some(format!(
         "SELECT table_name FROM information_schema.tables WHERE table_schema = '{escaped_db}' ORDER BY table_name"
     ))
+}
+
+fn parse_show_create_table(sql: &str, current_db: &str) -> Option<(String, String)> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let original_tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    let tokens: Vec<String> = original_tokens
+        .iter()
+        .map(|t| t.to_ascii_lowercase())
+        .collect();
+
+    if tokens.len() != 4 || tokens[0] != "show" || tokens[1] != "create" || tokens[2] != "table" {
+        return None;
+    }
+
+    let name = trim_identifier_quotes(original_tokens[3]);
+    if let Some((db, table)) = name.split_once('.') {
+        return Some((
+            trim_identifier_quotes(db).to_string(),
+            trim_identifier_quotes(table).to_string(),
+        ));
+    }
+
+    Some((current_db.to_string(), name.to_string()))
 }
 
 fn trim_identifier_quotes(input: &str) -> &str {
