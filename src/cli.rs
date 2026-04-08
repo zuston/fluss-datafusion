@@ -1,3 +1,10 @@
+//! CLI Interactive SQL Session
+//!
+//! Provides interactive REPL, supporting:
+//! - Standard SQL statement execution
+//! - Fluss-specific SHOW/DESCRIBE commands
+//! - Meta-commands (\dt, \q, \?)
+
 use std::sync::Arc;
 
 use arrow::util::pretty::pretty_format_batches;
@@ -6,16 +13,20 @@ use fluss::client::FlussConnection;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
-/// Interactive SQL session backed by DataFusion + Fluss.
+use crate::sql::{rewriter::rewrite_sql, SqlContext};
+
+/// Interactive SQL session
 pub struct FlussCliSession {
     ctx: SessionContext,
+    conn: Arc<FlussConnection>,
 }
 
 impl FlussCliSession {
-    pub fn new(ctx: SessionContext, _conn: Arc<FlussConnection>) -> Self {
-        Self { ctx }
+    pub fn new(ctx: SessionContext, conn: Arc<FlussConnection>) -> Self {
+        Self { ctx, conn }
     }
 
+    /// Run interactive REPL
     pub async fn run(&mut self) {
         let mut rl = match DefaultEditor::new() {
             Ok(rl) => rl,
@@ -33,29 +44,32 @@ impl FlussCliSession {
                 Ok(line) => {
                     let trimmed = line.trim();
 
-                    // Meta commands.
+                    // Handle meta-commands
                     if buf.is_empty() {
-                        if trimmed == "\\q" || trimmed == "quit" || trimmed == "exit" {
-                            println!("Bye!");
-                            break;
-                        }
-                        if trimmed == "\\?" || trimmed == "help" {
-                            print_help();
-                            continue;
-                        }
-                        if trimmed.starts_with("\\dt") {
-                            self.execute_sql("SHOW TABLES;").await;
-                            continue;
-                        }
-                        if trimmed.is_empty() {
-                            continue;
+                        match trimmed {
+                            "\\q" | "quit" | "exit" => {
+                                println!("Bye!");
+                                break;
+                            }
+                            "\\?" | "help" => {
+                                print_help();
+                                continue;
+                            }
+                            _ if trimmed.starts_with("\\dt") => {
+                                self.execute_sql("SHOW TABLES;").await;
+                                continue;
+                            }
+                            _ if trimmed.is_empty() => {
+                                continue;
+                            }
+                            _ => {}
                         }
                     }
 
                     buf.push(' ');
                     buf.push_str(trimmed);
 
-                    // If the statement ends with `;`, execute it.
+                    // Execute when statement ends with ;
                     if buf.trim_end().ends_with(';') {
                         let sql = buf.trim().to_string();
                         let _ = rl.add_history_entry(&sql);
@@ -75,11 +89,18 @@ impl FlussCliSession {
         }
     }
 
-    async fn execute_sql(&self, sql: &str) {
-        let rewritten = rewrite_sql(sql, self.current_database());
-        let sql_to_run = rewritten.as_deref().unwrap_or(sql);
+    /// Execute single SQL statement (for non-interactive mode)
+    pub async fn execute_sql(&self, sql: &str) {
+        let ctx = self.sql_context();
 
-        match self.ctx.sql(sql_to_run).await {
+        // Try to rewrite SQL (SHOW commands, etc.)
+        let sql_to_run = if let Some(rewritten) = rewrite_sql(sql, &ctx) {
+            rewritten
+        } else {
+            sql.to_string()
+        };
+
+        match self.ctx.sql(&sql_to_run).await {
             Ok(df) => match df.collect().await {
                 Ok(batches) => {
                     if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
@@ -97,14 +118,15 @@ impl FlussCliSession {
         }
     }
 
-    fn current_database(&self) -> String {
-        self.ctx
-            .state()
-            .config()
-            .options()
-            .catalog
-            .default_schema
-            .clone()
+    /// Get current SQL context
+    fn sql_context(&self) -> SqlContext {
+        let state = self.ctx.state();
+        let config = state.config().options();
+
+        SqlContext::new(
+            config.catalog.default_schema.clone(),
+            config.catalog.default_catalog.clone(),
+        )
     }
 }
 
@@ -113,82 +135,26 @@ fn print_help() {
         r#"
 Commands:
   SQL statements    End with ';' to execute
-  \dt               List tables in current database
+  \dt               List tables in current database (SHOW TABLES)
   \q / quit / exit  Quit
   \? / help         Show this help
+
+SQL Statements:
+  SELECT, INSERT, CREATE TABLE, etc.
+  SHOW TABLES [FROM db]
+  SHOW CREATE TABLE table_name
+  SHOW PARTITIONS table_name
+  SHOW BUCKETS table_name
+  SHOW [TABLE] OPTIONS table_name
+  DESCRIBE table_name
+  SHOW DATABASES
+
+Examples:
+  CREATE TABLE my_table (id INT PRIMARY KEY, name STRING);
+  INSERT INTO my_table VALUES (1, 'hello');
+  SELECT * FROM my_table;
+  SHOW PARTITIONS my_table;
+  DESCRIBE my_table;
 "#
     );
-}
-
-fn parse_show_tables(sql: &str) -> Option<Option<String>> {
-    let trimmed = sql.trim().trim_end_matches(';').trim();
-    let original_tokens: Vec<&str> = trimmed.split_whitespace().collect();
-    let tokens: Vec<String> = original_tokens
-        .iter()
-        .map(|t| t.to_ascii_lowercase())
-        .collect();
-
-    if tokens.len() == 2 && tokens[0] == "show" && tokens[1] == "tables" {
-        return Some(None);
-    }
-
-    if tokens.len() == 4
-        && tokens[0] == "show"
-        && tokens[1] == "tables"
-        && (tokens[2] == "from" || tokens[2] == "in")
-    {
-        return Some(Some(original_tokens[3].to_string()));
-    }
-
-    None
-}
-
-fn rewrite_sql(sql: &str, current_db: String) -> Option<String> {
-    if let Some((database, table_name)) = parse_show_create_table(sql, &current_db) {
-        let escaped_db = database.replace('\'', "''");
-        let escaped_table = table_name.replace('\'', "''");
-        return Some(format!(
-            "SELECT create_table FROM information_schema.table_ddl WHERE table_schema = '{escaped_db}' AND table_name = '{escaped_table}'"
-        ));
-    }
-
-    let database = parse_show_tables(sql)?
-        .map(|db| trim_identifier_quotes(&db).to_string())
-        .unwrap_or(current_db);
-    let escaped_db = database.replace('\'', "''");
-
-    Some(format!(
-        "SELECT table_name FROM information_schema.tables WHERE table_schema = '{escaped_db}' ORDER BY table_name"
-    ))
-}
-
-fn parse_show_create_table(sql: &str, current_db: &str) -> Option<(String, String)> {
-    let trimmed = sql.trim().trim_end_matches(';').trim();
-    let original_tokens: Vec<&str> = trimmed.split_whitespace().collect();
-    let tokens: Vec<String> = original_tokens
-        .iter()
-        .map(|t| t.to_ascii_lowercase())
-        .collect();
-
-    if tokens.len() != 4 || tokens[0] != "show" || tokens[1] != "create" || tokens[2] != "table" {
-        return None;
-    }
-
-    let name = trim_identifier_quotes(original_tokens[3]);
-    if let Some((db, table)) = name.split_once('.') {
-        return Some((
-            trim_identifier_quotes(db).to_string(),
-            trim_identifier_quotes(table).to_string(),
-        ));
-    }
-
-    Some((current_db.to_string(), name.to_string()))
-}
-
-fn trim_identifier_quotes(input: &str) -> &str {
-    input
-        .strip_prefix('`')
-        .and_then(|s| s.strip_suffix('`'))
-        .or_else(|| input.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
-        .unwrap_or(input)
 }

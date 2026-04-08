@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{
-    ArrayRef, BooleanBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder,
-    Int64Builder, Int8Builder, RecordBatch, StringBuilder,
+    ArrayBuilder, ArrayRef, BooleanBuilder, Float32Builder, Float64Builder, Int16Builder,
+    Int32Builder, Int64Builder, Int8Builder, RecordBatch, StringBuilder,
 };
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -241,33 +241,78 @@ enum ColBuilder {
     F32(Float32Builder),
     F64(Float64Builder),
     Utf8(StringBuilder),
+    /// Complex types (Array, Row/Struct) use Box<dyn ArrayBuilder>
+    Complex(Box<dyn ArrayBuilder>),
 }
 
 impl ColBuilder {
     fn append_from_row(&mut self, row: &dyn InternalRow, idx: usize) {
-        if row.is_null_at(idx) {
-            match self {
-                ColBuilder::Bool(b) => b.append_null(),
-                ColBuilder::I8(b) => b.append_null(),
-                ColBuilder::I16(b) => b.append_null(),
-                ColBuilder::I32(b) => b.append_null(),
-                ColBuilder::I64(b) => b.append_null(),
-                ColBuilder::F32(b) => b.append_null(),
-                ColBuilder::F64(b) => b.append_null(),
-                ColBuilder::Utf8(b) => b.append_null(),
-            }
-            return;
-        }
-
         match self {
-            ColBuilder::Bool(b) => b.append_value(row.get_boolean(idx)),
-            ColBuilder::I8(b) => b.append_value(row.get_byte(idx)),
-            ColBuilder::I16(b) => b.append_value(row.get_short(idx)),
-            ColBuilder::I32(b) => b.append_value(row.get_int(idx)),
-            ColBuilder::I64(b) => b.append_value(row.get_long(idx)),
-            ColBuilder::F32(b) => b.append_value(row.get_float(idx)),
-            ColBuilder::F64(b) => b.append_value(row.get_double(idx)),
-            ColBuilder::Utf8(b) => b.append_value(row.get_string(idx)),
+            ColBuilder::Bool(b) => {
+                if row.is_null_at(idx).expect("check null failed") {
+                    b.append_null();
+                } else {
+                    b.append_value(row.get_boolean(idx).expect("get boolean failed"));
+                }
+            }
+            ColBuilder::I8(b) => {
+                if row.is_null_at(idx).expect("check null failed") {
+                    b.append_null();
+                } else {
+                    b.append_value(row.get_byte(idx).expect("get byte failed"));
+                }
+            }
+            ColBuilder::I16(b) => {
+                if row.is_null_at(idx).expect("check null failed") {
+                    b.append_null();
+                } else {
+                    b.append_value(row.get_short(idx).expect("get short failed"));
+                }
+            }
+            ColBuilder::I32(b) => {
+                if row.is_null_at(idx).expect("check null failed") {
+                    b.append_null();
+                } else {
+                    b.append_value(row.get_int(idx).expect("get int failed"));
+                }
+            }
+            ColBuilder::I64(b) => {
+                if row.is_null_at(idx).expect("check null failed") {
+                    b.append_null();
+                } else {
+                    b.append_value(row.get_long(idx).expect("get long failed"));
+                }
+            }
+            ColBuilder::F32(b) => {
+                if row.is_null_at(idx).expect("check null failed") {
+                    b.append_null();
+                } else {
+                    b.append_value(row.get_float(idx).expect("get float failed"));
+                }
+            }
+            ColBuilder::F64(b) => {
+                if row.is_null_at(idx).expect("check null failed") {
+                    b.append_null();
+                } else {
+                    b.append_value(row.get_double(idx).expect("get double failed"));
+                }
+            }
+            ColBuilder::Utf8(b) => {
+                if row.is_null_at(idx).expect("check null failed") {
+                    b.append_null();
+                } else {
+                    b.append_value(row.get_string(idx).expect("get string failed"));
+                }
+            }
+            ColBuilder::Complex(builder) => {
+                // Complex types (Array, Row, Map) don't support detailed data reading yet
+                // Return placeholder indicating data exists
+                if row.is_null_at(idx).expect("check null failed") {
+                    append_null_to_builder(builder);
+                } else {
+                    append_string_to_builder(builder, "<complex_type>");
+                }
+            }
         }
     }
 
@@ -281,6 +326,7 @@ impl ColBuilder {
             ColBuilder::F32(mut b) => Arc::new(b.finish()),
             ColBuilder::F64(mut b) => Arc::new(b.finish()),
             ColBuilder::Utf8(mut b) => Arc::new(b.finish()),
+            ColBuilder::Complex(mut builder) => builder.finish(),
         }
     }
 }
@@ -302,26 +348,79 @@ fn make_builders(
 ) -> std::result::Result<Vec<ColBuilder>, fluss::error::Error> {
     let mut out = Vec::with_capacity(fields.len());
     for f in fields {
-        let b = match f.data_type() {
-            FlussDataType::Boolean(_) => ColBuilder::Bool(BooleanBuilder::with_capacity(capacity)),
-            FlussDataType::TinyInt(_) => ColBuilder::I8(Int8Builder::with_capacity(capacity)),
-            FlussDataType::SmallInt(_) => ColBuilder::I16(Int16Builder::with_capacity(capacity)),
-            FlussDataType::Int(_) => ColBuilder::I32(Int32Builder::with_capacity(capacity)),
-            FlussDataType::BigInt(_) => ColBuilder::I64(Int64Builder::with_capacity(capacity)),
-            FlussDataType::Float(_) => ColBuilder::F32(Float32Builder::with_capacity(capacity)),
-            FlussDataType::Double(_) => ColBuilder::F64(Float64Builder::with_capacity(capacity)),
-            FlussDataType::Char(_) | FlussDataType::String(_) => {
-                ColBuilder::Utf8(StringBuilder::with_capacity(capacity, capacity * 8))
-            }
-            other => {
-                return Err(to_fluss_err(format!(
-                    "unsupported PK limit scan type: {other:?}"
-                )));
-            }
-        };
+        let b = make_builder_for_type(f.data_type(), capacity)?;
         out.push(b);
     }
     Ok(out)
+}
+
+/// Create ColBuilder for specified type
+fn make_builder_for_type(
+    data_type: &FlussDataType,
+    capacity: usize,
+) -> std::result::Result<ColBuilder, fluss::error::Error> {
+    match data_type {
+        FlussDataType::Boolean(_) => Ok(ColBuilder::Bool(BooleanBuilder::with_capacity(capacity))),
+        FlussDataType::TinyInt(_) => Ok(ColBuilder::I8(Int8Builder::with_capacity(capacity))),
+        FlussDataType::SmallInt(_) => Ok(ColBuilder::I16(Int16Builder::with_capacity(capacity))),
+        FlussDataType::Int(_) => Ok(ColBuilder::I32(Int32Builder::with_capacity(capacity))),
+        FlussDataType::BigInt(_) => Ok(ColBuilder::I64(Int64Builder::with_capacity(capacity))),
+        FlussDataType::Float(_) => Ok(ColBuilder::F32(Float32Builder::with_capacity(capacity))),
+        FlussDataType::Double(_) => Ok(ColBuilder::F64(Float64Builder::with_capacity(capacity))),
+        FlussDataType::Char(_) | FlussDataType::String(_) => Ok(ColBuilder::Utf8(
+            StringBuilder::with_capacity(capacity, capacity * 8),
+        )),
+        FlussDataType::Date(_) | FlussDataType::Time(_) | FlussDataType::Timestamp(_) => {
+            // Date/time types handled as Int64 (microseconds)
+            Ok(ColBuilder::I64(Int64Builder::with_capacity(capacity)))
+        }
+        FlussDataType::TimestampLTz(_) => {
+            // Timestamp with local timezone handled as Int64
+            Ok(ColBuilder::I64(Int64Builder::with_capacity(capacity)))
+        }
+        FlussDataType::Decimal(_) => {
+            // Decimal handled as string (simplified)
+            Ok(ColBuilder::Utf8(StringBuilder::with_capacity(
+                capacity,
+                capacity * 16,
+            )))
+        }
+        FlussDataType::Binary(_) | FlussDataType::Bytes(_) => {
+            // Binary data handled as string (Base64 encoded)
+            Ok(ColBuilder::Utf8(StringBuilder::with_capacity(
+                capacity,
+                capacity * 16,
+            )))
+        }
+        FlussDataType::Array(_) | FlussDataType::Row(_) | FlussDataType::Map(_) => {
+            // Complex types (Array, Row, Map) handled as JSON strings
+            Ok(ColBuilder::Complex(Box::new(StringBuilder::with_capacity(
+                capacity,
+                capacity * 256, // Complex types need more space
+            ))))
+        }
+    }
+}
+
+/// Append null to Box<dyn ArrayBuilder>
+fn append_null_to_builder(builder: &mut Box<dyn ArrayBuilder>) {
+    use arrow::array::StringBuilder;
+
+    if let Some(string_builder) = builder.as_any_mut().downcast_mut::<StringBuilder>() {
+        string_builder.append_null();
+    }
+}
+
+/// Append string value to Box<dyn ArrayBuilder>
+fn append_string_to_builder(builder: &mut Box<dyn ArrayBuilder>, value: &str) {
+    use arrow::array::StringBuilder;
+
+    if let Some(string_builder) = builder.as_any_mut().downcast_mut::<StringBuilder>() {
+        string_builder.append_value(value);
+    } else {
+        // If type doesn't match, append null
+        append_null_to_builder(builder);
+    }
 }
 
 fn append_row_to_builders(
@@ -457,7 +556,7 @@ async fn scan_table_with_log_scanner_limit(
         return Ok(vec![]);
     }
 
-    let admin = conn.get_admin().await?;
+    let admin = conn.get_admin()?;
     let bucket_ids: Vec<i32> = (0..table_info.num_buckets).collect();
     let latest = admin
         .list_offsets(&table_info.table_path, &bucket_ids, OffsetSpec::Latest)

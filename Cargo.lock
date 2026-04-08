@@ -1593,8 +1593,8 @@ dependencies = [
 
 [[package]]
 name = "fluss-rs"
-version = "0.1.0"
-source = "git+https://github.com/zuston/fluss-rust.git?branch=test_all_1#a996091ce104c118df2c684a9f0422d7f853c086"
+version = "0.2.0"
+source = "git+https://github.com/apache/fluss-rust.git?branch=main#fd581bac6c2d168e82b75df7093f836f31514a87"
 dependencies = [
  "arrow",
  "arrow-schema",
