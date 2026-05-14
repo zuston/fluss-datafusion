@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-fluss = { package = "fluss-rs", git = "https://github.com/apache/fluss-rust.git", branch = "main" }
+fluss = { package = "fluss-rs", git = "https://github.com/zuston/fluss-rust.git", branch = "cursor/iceberg-kv-key-encoding-kv-format-version" }
 datafusion = "52.1.0"
 arrow = { version = "57", features = ["prettyprint", "json"] }
 arrow-schema = "57"
