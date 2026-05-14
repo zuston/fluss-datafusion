@@ -106,7 +106,16 @@ impl FlussCliSession {
                     if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
                         println!("OK");
                     } else {
-                        match pretty_format_batches(&batches) {
+                        let to_show = match crate::cli_display::prepare_batches_for_terminal(
+                            &batches,
+                        ) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                eprintln!("Warning: nested column formatting failed ({e}); using default table layout.");
+                                batches.clone()
+                            }
+                        };
+                        match pretty_format_batches(&to_show) {
                             Ok(table) => println!("{table}"),
                             Err(e) => eprintln!("Format error: {e}"),
                         }

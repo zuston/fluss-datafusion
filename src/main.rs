@@ -30,6 +30,7 @@ use nu_ansi_term::Color;
 
 mod catalog;
 mod cli;
+mod cli_display;
 mod error;
 mod provider;
 mod sql;
