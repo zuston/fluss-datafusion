@@ -1596,7 +1596,7 @@ dependencies = [
 [[package]]
 name = "fluss-rs"
 version = "0.2.0"
-source = "git+https://github.com/apache/fluss-rust.git?branch=main#2b719f1152b9288d4a2c65bf5f6700ff992c3f65"
+source = "git+https://github.com/zuston/fluss-rust.git?branch=cursor%2Ficeberg-kv-key-encoding-kv-format-version#fda2d656a5214a2b49fe876e6ed48764f535dc35"
 dependencies = [
  "arrow",
  "arrow-schema",
