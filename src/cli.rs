@@ -43,7 +43,10 @@ impl FlussCliSession {
         if let Some(ref path) = history_path {
             if path.exists() {
                 if let Err(e) = rl.load_history(path) {
-                    eprintln!("Warning: could not load CLI history ({}): {e}", path.display());
+                    eprintln!(
+                        "Warning: could not load CLI history ({}): {e}",
+                        path.display()
+                    );
                 }
             }
         }
@@ -167,13 +170,19 @@ fn save_repl_history(rl: &mut DefaultEditor, path: &Path) {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             if let Err(e) = std::fs::create_dir_all(parent) {
-                eprintln!("Warning: could not create CLI history directory ({}): {e}", parent.display());
+                eprintln!(
+                    "Warning: could not create CLI history directory ({}): {e}",
+                    parent.display()
+                );
                 return;
             }
         }
     }
     if let Err(e) = rl.save_history(path) {
-        eprintln!("Warning: could not save CLI history ({}): {e}", path.display());
+        eprintln!(
+            "Warning: could not save CLI history ({}): {e}",
+            path.display()
+        );
     }
 }
 
