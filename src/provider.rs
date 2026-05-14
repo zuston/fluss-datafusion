@@ -7,10 +7,7 @@ use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{
-    ArrayBuilder, ArrayRef, BooleanBuilder, Float32Builder, Float64Builder, Int16Builder,
-    Int32Builder, Int64Builder, Int8Builder, RecordBatch, StringBuilder,
-};
+use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
@@ -23,8 +20,8 @@ use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use fluss::client::FlussConnection;
 use fluss::metadata::{DataType as FlussDataType, TableInfo};
-use fluss::record::to_arrow_schema;
-use fluss::row::{GenericRow, InternalRow};
+use fluss::record::{to_arrow_schema, RowAppendRecordBatchBuilder};
+use fluss::row::GenericRow;
 use futures::StreamExt;
 
 use crate::error::fluss_err;
@@ -232,214 +229,6 @@ pub(crate) async fn scan_table(
     scan_table_with_log_scanner_limit(conn, table_info, projection, limit).await
 }
 
-enum ColBuilder {
-    Bool(BooleanBuilder),
-    I8(Int8Builder),
-    I16(Int16Builder),
-    I32(Int32Builder),
-    I64(Int64Builder),
-    F32(Float32Builder),
-    F64(Float64Builder),
-    Utf8(StringBuilder),
-    /// Complex types (Array, Row/Struct) use Box<dyn ArrayBuilder>
-    Complex(Box<dyn ArrayBuilder>),
-}
-
-impl ColBuilder {
-    fn append_from_row(&mut self, row: &dyn InternalRow, idx: usize) {
-        match self {
-            ColBuilder::Bool(b) => {
-                if row.is_null_at(idx).expect("check null failed") {
-                    b.append_null();
-                } else {
-                    b.append_value(row.get_boolean(idx).expect("get boolean failed"));
-                }
-            }
-            ColBuilder::I8(b) => {
-                if row.is_null_at(idx).expect("check null failed") {
-                    b.append_null();
-                } else {
-                    b.append_value(row.get_byte(idx).expect("get byte failed"));
-                }
-            }
-            ColBuilder::I16(b) => {
-                if row.is_null_at(idx).expect("check null failed") {
-                    b.append_null();
-                } else {
-                    b.append_value(row.get_short(idx).expect("get short failed"));
-                }
-            }
-            ColBuilder::I32(b) => {
-                if row.is_null_at(idx).expect("check null failed") {
-                    b.append_null();
-                } else {
-                    b.append_value(row.get_int(idx).expect("get int failed"));
-                }
-            }
-            ColBuilder::I64(b) => {
-                if row.is_null_at(idx).expect("check null failed") {
-                    b.append_null();
-                } else {
-                    b.append_value(row.get_long(idx).expect("get long failed"));
-                }
-            }
-            ColBuilder::F32(b) => {
-                if row.is_null_at(idx).expect("check null failed") {
-                    b.append_null();
-                } else {
-                    b.append_value(row.get_float(idx).expect("get float failed"));
-                }
-            }
-            ColBuilder::F64(b) => {
-                if row.is_null_at(idx).expect("check null failed") {
-                    b.append_null();
-                } else {
-                    b.append_value(row.get_double(idx).expect("get double failed"));
-                }
-            }
-            ColBuilder::Utf8(b) => {
-                if row.is_null_at(idx).expect("check null failed") {
-                    b.append_null();
-                } else {
-                    b.append_value(row.get_string(idx).expect("get string failed"));
-                }
-            }
-            ColBuilder::Complex(builder) => {
-                // Complex types (Array, Row, Map) don't support detailed data reading yet
-                // Return placeholder indicating data exists
-                if row.is_null_at(idx).expect("check null failed") {
-                    append_null_to_builder(builder);
-                } else {
-                    append_string_to_builder(builder, "<complex_type>");
-                }
-            }
-        }
-    }
-
-    fn finish(self) -> ArrayRef {
-        match self {
-            ColBuilder::Bool(mut b) => Arc::new(b.finish()),
-            ColBuilder::I8(mut b) => Arc::new(b.finish()),
-            ColBuilder::I16(mut b) => Arc::new(b.finish()),
-            ColBuilder::I32(mut b) => Arc::new(b.finish()),
-            ColBuilder::I64(mut b) => Arc::new(b.finish()),
-            ColBuilder::F32(mut b) => Arc::new(b.finish()),
-            ColBuilder::F64(mut b) => Arc::new(b.finish()),
-            ColBuilder::Utf8(mut b) => Arc::new(b.finish()),
-            ColBuilder::Complex(mut builder) => builder.finish(),
-        }
-    }
-}
-
-fn projected_fields<'a>(
-    table_info: &'a TableInfo,
-    projection: Option<&[usize]>,
-) -> Vec<&'a fluss::metadata::DataField> {
-    let fields = table_info.row_type.fields();
-    match projection {
-        Some(idxs) => idxs.iter().map(|&i| &fields[i]).collect(),
-        None => fields.iter().collect(),
-    }
-}
-
-fn make_builders(
-    fields: &[&fluss::metadata::DataField],
-    capacity: usize,
-) -> std::result::Result<Vec<ColBuilder>, fluss::error::Error> {
-    let mut out = Vec::with_capacity(fields.len());
-    for f in fields {
-        let b = make_builder_for_type(f.data_type(), capacity)?;
-        out.push(b);
-    }
-    Ok(out)
-}
-
-/// Create ColBuilder for specified type
-fn make_builder_for_type(
-    data_type: &FlussDataType,
-    capacity: usize,
-) -> std::result::Result<ColBuilder, fluss::error::Error> {
-    match data_type {
-        FlussDataType::Boolean(_) => Ok(ColBuilder::Bool(BooleanBuilder::with_capacity(capacity))),
-        FlussDataType::TinyInt(_) => Ok(ColBuilder::I8(Int8Builder::with_capacity(capacity))),
-        FlussDataType::SmallInt(_) => Ok(ColBuilder::I16(Int16Builder::with_capacity(capacity))),
-        FlussDataType::Int(_) => Ok(ColBuilder::I32(Int32Builder::with_capacity(capacity))),
-        FlussDataType::BigInt(_) => Ok(ColBuilder::I64(Int64Builder::with_capacity(capacity))),
-        FlussDataType::Float(_) => Ok(ColBuilder::F32(Float32Builder::with_capacity(capacity))),
-        FlussDataType::Double(_) => Ok(ColBuilder::F64(Float64Builder::with_capacity(capacity))),
-        FlussDataType::Char(_) | FlussDataType::String(_) => Ok(ColBuilder::Utf8(
-            StringBuilder::with_capacity(capacity, capacity * 8),
-        )),
-        FlussDataType::Date(_) | FlussDataType::Time(_) | FlussDataType::Timestamp(_) => {
-            // Date/time types handled as Int64 (microseconds)
-            Ok(ColBuilder::I64(Int64Builder::with_capacity(capacity)))
-        }
-        FlussDataType::TimestampLTz(_) => {
-            // Timestamp with local timezone handled as Int64
-            Ok(ColBuilder::I64(Int64Builder::with_capacity(capacity)))
-        }
-        FlussDataType::Decimal(_) => {
-            // Decimal handled as string (simplified)
-            Ok(ColBuilder::Utf8(StringBuilder::with_capacity(
-                capacity,
-                capacity * 16,
-            )))
-        }
-        FlussDataType::Binary(_) | FlussDataType::Bytes(_) => {
-            // Binary data handled as string (Base64 encoded)
-            Ok(ColBuilder::Utf8(StringBuilder::with_capacity(
-                capacity,
-                capacity * 16,
-            )))
-        }
-        FlussDataType::Array(_) | FlussDataType::Row(_) | FlussDataType::Map(_) => {
-            // Complex types (Array, Row, Map) handled as JSON strings
-            Ok(ColBuilder::Complex(Box::new(StringBuilder::with_capacity(
-                capacity,
-                capacity * 256, // Complex types need more space
-            ))))
-        }
-    }
-}
-
-/// Append null to Box<dyn ArrayBuilder>
-fn append_null_to_builder(builder: &mut Box<dyn ArrayBuilder>) {
-    use arrow::array::StringBuilder;
-
-    if let Some(string_builder) = builder.as_any_mut().downcast_mut::<StringBuilder>() {
-        string_builder.append_null();
-    }
-}
-
-/// Append string value to Box<dyn ArrayBuilder>
-fn append_string_to_builder(builder: &mut Box<dyn ArrayBuilder>, value: &str) {
-    use arrow::array::StringBuilder;
-
-    if let Some(string_builder) = builder.as_any_mut().downcast_mut::<StringBuilder>() {
-        string_builder.append_value(value);
-    } else {
-        // If type doesn't match, append null
-        append_null_to_builder(builder);
-    }
-}
-
-fn append_row_to_builders(
-    builders: &mut [ColBuilder],
-    row: &dyn InternalRow,
-    row_indices: &[usize],
-) {
-    for (b, idx) in builders.iter_mut().zip(row_indices.iter().copied()) {
-        b.append_from_row(row, idx);
-    }
-}
-
-fn projected_indices(table_info: &TableInfo, projection: Option<&[usize]>) -> Vec<usize> {
-    match projection {
-        Some(v) => v.to_vec(),
-        None => (0..table_info.row_type.fields().len()).collect(),
-    }
-}
-
 fn set_pk_key_from_scalar(
     key: &mut GenericRow<'_>,
     data_type: &FlussDataType,
@@ -503,43 +292,31 @@ pub(crate) async fn lookup_pk_row(
             table_info.table_path
         ))
     })?;
-    let Some(row) = result.get_single_row().map_err(|e| {
+
+    let batch = result.to_record_batch().map_err(|e| {
         to_fluss_err(format!(
-            "lookup step failed: get_single_row() on {}: {e:?}",
+            "lookup step failed: to_record_batch() on {}: {e:?}",
             table_info.table_path
         ))
-    })?
-    else {
-        return Ok(vec![]);
-    };
-
-    let indices = projected_indices(table_info, projection);
-    let projected_fields: Vec<&fluss::metadata::DataField> = indices
-        .iter()
-        .map(|&i| &table_info.row_type.fields()[i])
-        .collect();
-    let mut builders = make_builders(&projected_fields, 1).map_err(|e| {
-        to_fluss_err(format!(
-            "lookup step failed: make_builders() projected_fields={:?}: {e:?}",
-            projected_fields
-                .iter()
-                .map(|f| format!("{}:{:?}", f.name(), f.data_type()))
-                .collect::<Vec<_>>()
-        ))
     })?;
-    append_row_to_builders(&mut builders, &row, &indices);
 
-    let arrays: Vec<ArrayRef> = builders.into_iter().map(ColBuilder::finish).collect();
-    let schema = match projection {
-        Some(idxs) => Arc::new(
-            to_arrow_schema(&table_info.row_type)?
-                .project(idxs)
-                .map_err(|e| to_fluss_err(format!("project schema failed: {e}")))?,
-        ),
-        None => to_arrow_schema(&table_info.row_type)?,
+    if batch.num_rows() == 0 {
+        return Ok(vec![]);
+    }
+    if batch.num_rows() != 1 {
+        return Err(to_fluss_err(format!(
+            "lookup expected at most one row on {}, got {}",
+            table_info.table_path,
+            batch.num_rows()
+        )));
+    }
+
+    let batch = match projection {
+        Some(idxs) => batch
+            .project(idxs)
+            .map_err(|e| to_fluss_err(format!("project batch failed: {e}")))?,
+        None => batch,
     };
-    let batch = RecordBatch::try_new(schema, arrays)
-        .map_err(|e| to_fluss_err(format!("build record batch failed: {e}")))?;
     Ok(vec![batch])
 }
 
@@ -575,8 +352,21 @@ async fn scan_table_with_log_scanner_limit(
     let scanner = scan.create_log_scanner()?;
     scanner.subscribe_buckets(&subscribe_offsets).await?;
 
-    let fields = projected_fields(table_info, projection);
-    let mut builders = make_builders(&fields, lim)?;
+    let row_type_for_builder = match projection {
+        Some(idxs) => table_info.row_type.project(idxs).map_err(|e| {
+            to_fluss_err(format!(
+                "scan failed: row_type.project on {}: {e:?}",
+                table_info.table_path
+            ))
+        })?,
+        None => table_info.row_type.clone(),
+    };
+    let mut builder = RowAppendRecordBatchBuilder::new(&row_type_for_builder).map_err(|e| {
+        to_fluss_err(format!(
+            "scan failed: RowAppendRecordBatchBuilder::new on {}: {e:?}",
+            table_info.table_path
+        ))
+    })?;
     let mut collected = 0usize;
     let mut empty_polls = 0usize;
 
@@ -589,10 +379,12 @@ async fn scan_table_with_log_scanner_limit(
         empty_polls = 0;
 
         for rec in records {
-            let row = rec.row();
-            for (i, b) in builders.iter_mut().enumerate() {
-                b.append_from_row(row, i);
-            }
+            builder.append(rec.row()).map_err(|e| {
+                to_fluss_err(format!(
+                    "scan failed: append row on {}: {e:?}",
+                    table_info.table_path
+                ))
+            })?;
             collected += 1;
             if collected >= lim {
                 break;
@@ -604,17 +396,15 @@ async fn scan_table_with_log_scanner_limit(
         return Ok(vec![]);
     }
 
-    let arrays: Vec<ArrayRef> = builders.into_iter().map(ColBuilder::finish).collect();
-    let schema = match projection {
-        Some(idxs) => Arc::new(
-            to_arrow_schema(&table_info.row_type)?
-                .project(idxs)
-                .map_err(|e| to_fluss_err(format!("project schema failed: {e}")))?,
-        ),
-        None => to_arrow_schema(&table_info.row_type)?,
-    };
-    let batch = RecordBatch::try_new(schema, arrays)
-        .map_err(|e| to_fluss_err(format!("build record batch failed: {e}")))?;
+    let batch = builder
+        .build_arrow_record_batch()
+        .map_err(|e| {
+            to_fluss_err(format!(
+                "scan failed: build_arrow_record_batch on {}: {e:?}",
+                table_info.table_path
+            ))
+        })
+        .map(Arc::unwrap_or_clone)?;
     Ok(vec![batch])
 }
 
