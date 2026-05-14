@@ -4,7 +4,9 @@
 //! - Standard SQL statement execution
 //! - Fluss-specific SHOW/DESCRIBE commands
 //! - Meta-commands (\dt, \q, \?)
+//! - Persistent readline history across CLI sessions
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::util::pretty::pretty_format_batches;
@@ -28,6 +30,8 @@ impl FlussCliSession {
 
     /// Run interactive REPL
     pub async fn run(&mut self) {
+        let history_path = repl_history_file();
+
         let mut rl = match DefaultEditor::new() {
             Ok(rl) => rl,
             Err(e) => {
@@ -35,6 +39,14 @@ impl FlussCliSession {
                 return;
             }
         };
+
+        if let Some(ref path) = history_path {
+            if path.exists() {
+                if let Err(e) = rl.load_history(path) {
+                    eprintln!("Warning: could not load CLI history ({}): {e}", path.display());
+                }
+            }
+        }
 
         let mut buf = String::new();
 
@@ -86,6 +98,10 @@ impl FlussCliSession {
                     break;
                 }
             }
+        }
+
+        if let Some(ref path) = history_path {
+            save_repl_history(&mut rl, path);
         }
     }
 
@@ -139,11 +155,33 @@ impl FlussCliSession {
     }
 }
 
+/// Default location: `~/.fluss-datafusion/repl_history` (or `%USERPROFILE%\.fluss-datafusion\repl_history` on Windows).
+fn repl_history_file() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))?;
+    Some(home.join(".fluss-datafusion").join("repl_history"))
+}
+
+fn save_repl_history(rl: &mut DefaultEditor, path: &Path) {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                eprintln!("Warning: could not create CLI history directory ({}): {e}", parent.display());
+                return;
+            }
+        }
+    }
+    if let Err(e) = rl.save_history(path) {
+        eprintln!("Warning: could not save CLI history ({}): {e}", path.display());
+    }
+}
+
 fn print_help() {
     println!(
         r#"
 Commands:
-  SQL statements    End with ';' to execute
+  SQL statements    End with ';' to execute (↑/↓ for history from past sessions)
   \dt               List tables in current database (SHOW TABLES)
   \q / quit / exit  Quit
   \? / help         Show this help
